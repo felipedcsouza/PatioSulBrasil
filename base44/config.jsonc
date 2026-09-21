@@ -1,0 +1,6 @@
+{
+  // Modelo local. Substitua pelos dados oficiais do seu projeto Base44.
+  "appName": "Patio Flow Pro",
+  "environment": "development",
+  "entitiesDir": "./entities"
+}

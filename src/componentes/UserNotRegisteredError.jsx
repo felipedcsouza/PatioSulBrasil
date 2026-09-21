@@ -1,0 +1,1 @@
+export default function UserNotRegisteredError() { return <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm font-medium text-red-700">Usuário não cadastrado ou sem permissão para acessar este recurso.</div> }

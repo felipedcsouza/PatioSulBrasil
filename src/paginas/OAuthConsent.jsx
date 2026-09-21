@@ -1,0 +1,1 @@
+export default function OAuthConsent(){return <div className="mx-auto max-w-xl rounded-2xl bg-white p-6 shadow"><h1 className="text-2xl font-black">Consentimento OAuth</h1><p className="mt-2 text-slate-500">Área reservada para consentimento de autenticação externa.</p></div>}

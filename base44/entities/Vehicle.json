@@ -1,0 +1,11 @@
+{
+  "name": "Vehicle",
+  "fields": {
+    "plate": "string",
+    "brand": "string",
+    "model": "string",
+    "status": "string",
+    "entryDate": "date",
+    "destination": "string"
+  }
+}
