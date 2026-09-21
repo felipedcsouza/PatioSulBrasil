@@ -13,7 +13,7 @@ import {
 } from "react-router-dom";
 
 import { useAuth } from "../biblioteca/AuthContext";
-import imagenPatioSul from "../assets/imagenPatioSul.png";
+import imagenPatioSul from "../assets/logo-patio-sul-brasil.png";
 
 // =======================================================
 // ITENS DO MENU
