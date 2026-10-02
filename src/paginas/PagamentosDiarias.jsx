@@ -113,6 +113,34 @@ function rotuloFormaPagamento(valor) {
   return FORMAS_PAGAMENTO.find((item) => item.value === valor)?.label || valor || "-";
 }
 
+function escaparHtml(valor) {
+  return String(valor ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function imagemQrPix(base64) {
+  if (!base64) return "";
+  const valor = String(base64).trim();
+  return valor.startsWith("data:") ? valor : `data:image/png;base64,${valor}`;
+}
+
+function rotuloStatusPix(status, detalhe) {
+  if (status === "approved" || detalhe === "accredited") return "PAGO";
+  if (status === "cancelled" || status === "canceled") return "CANCELADO";
+  if (status === "rejected") return "RECUSADO";
+  if (status === "expired") return "EXPIRADO";
+  if (status === "action_required" || detalhe === "waiting_transfer") {
+    return "AGUARDANDO PAGAMENTO";
+  }
+  return String(status || detalhe || "AGUARDANDO PAGAMENTO")
+    .replace(/_/g, " ")
+    .toUpperCase();
+}
+
 export default function PagamentosDiarias() {
   const { perfil, user, isMaster } = useAuth();
 
@@ -140,6 +168,11 @@ export default function PagamentosDiarias() {
     referencia: "",
     observacoes: "",
   });
+
+  const [cobrancaPix, setCobrancaPix] = useState(null);
+  const [emailPix, setEmailPix] = useState("");
+  const [gerandoPixId, setGerandoPixId] = useState(null);
+  const [pixTemporarios, setPixTemporarios] = useState({});
 
   useEffect(() => {
     if (!perfil) return;
@@ -238,6 +271,47 @@ export default function PagamentosDiarias() {
       (total, item) => total + Number(item.valor || 0),
       0
     );
+  }
+
+  function dadosPixCobranca(cobranca) {
+    if (!cobranca) return null;
+    if (cobranca.__pix) return cobranca.__pix;
+
+    const temporario = pixTemporarios[String(cobranca.id)];
+    if (temporario) return temporario;
+
+    const possuiPix = Boolean(
+      cobranca.pix_qr_code_base64 ||
+      cobranca.pix_copia_cola ||
+      cobranca.mercado_pago_order_id ||
+      cobranca.mercado_pago_payment_id
+    );
+
+    if (!possuiPix) return null;
+
+    return {
+      orderId: cobranca.mercado_pago_order_id || "",
+      paymentId: cobranca.mercado_pago_payment_id || "",
+      status: cobranca.mercado_pago_status || "",
+      statusDetalhe: cobranca.mercado_pago_status_detalhe || "",
+      email: cobranca.pix_email || "",
+      geradoEm: cobranca.pix_gerado_em || "",
+      pix: {
+        copiaCola: cobranca.pix_copia_cola || "",
+        qrCodeBase64: cobranca.pix_qr_code_base64 || "",
+        ticketUrl: cobranca.pix_ticket_url || "",
+      },
+    };
+  }
+
+  function emailPadraoPix(cobranca) {
+    const veiculo = veiculoPorId(cobranca?.veiculo_id);
+    return String(
+      veiculo?.email ||
+      veiculo?.proprietario_email ||
+      user?.email ||
+      ""
+    ).trim();
   }
 
   function statusFinanceiro(cobranca) {
@@ -444,6 +518,209 @@ export default function PagamentosDiarias() {
     setCobrancaPagamento(null);
   }
 
+  function abrirPix(cobranca) {
+    const total = Number(cobranca?.valor_total || 0);
+    const pago = totalPagoVeiculo(cobranca?.veiculo_id);
+    const saldo = Math.max(0, total - pago);
+
+    if (saldo <= 0.009) {
+      setErro("Esta cobrança já está totalmente paga.");
+      return;
+    }
+
+    setErro("");
+    setMensagem("");
+    setCobrancaPix(cobranca);
+
+    const pixExistente = dadosPixCobranca(cobranca);
+    setEmailPix(
+      pixExistente?.email ||
+      emailPadraoPix(cobranca)
+    );
+  }
+
+  function fecharPix() {
+    if (gerandoPixId) return;
+    setCobrancaPix(null);
+  }
+
+  async function copiarCodigoPix(copiaCola) {
+    if (!copiaCola) return;
+
+    try {
+      await navigator.clipboard.writeText(copiaCola);
+      setMensagem("Código PIX copiado para a área de transferência.");
+      setErro("");
+    } catch (error) {
+      console.error("Erro ao copiar PIX:", error);
+      setErro("Não foi possível copiar automaticamente. Selecione o código PIX e copie manualmente.");
+    }
+  }
+
+  async function gerarPixMercadoPago(cobranca, emailInformado, opcoes = {}) {
+    const { forcarNovo = false, mostrarMensagem = true } = opcoes;
+
+    if (!cobranca) {
+      throw new Error("Cobrança não encontrada.");
+    }
+
+    const total = Number(cobranca.valor_total || 0);
+    const pago = totalPagoVeiculo(cobranca.veiculo_id);
+    const saldo = Math.max(0, total - pago);
+
+    if (saldo <= 0.009) {
+      throw new Error("Esta cobrança já está totalmente paga.");
+    }
+
+    const pixExistente = dadosPixCobranca(cobranca);
+    if (!forcarNovo && pixExistente?.pix?.qrCodeBase64 && pixExistente?.pix?.copiaCola) {
+      return {
+        ...cobranca,
+        __pix: pixExistente,
+      };
+    }
+
+    const email = String(emailInformado || emailPadraoPix(cobranca)).trim();
+    if (!email || !email.includes("@")) {
+      throw new Error("Informe um e-mail válido para gerar o PIX pelo Mercado Pago.");
+    }
+
+    const codigo = `COB-${String(cobranca.id).padStart(6, "0")}`;
+
+    setGerandoPixId(cobranca.id);
+    setErro("");
+    if (mostrarMensagem) setMensagem("");
+
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+
+      if (sessionError) {
+        console.error("Erro ao obter sessão do Supabase:", sessionError);
+        throw new Error(
+          "Não foi possível verificar sua sessão. Saia do sistema e entre novamente."
+        );
+      }
+
+      if (!session?.access_token) {
+        throw new Error(
+          "Sua sessão expirou. Saia do sistema e entre novamente antes de gerar o PIX."
+        );
+      }
+
+      const { data, error } = await supabase.functions.invoke(
+        "mercado-pago-criar-pix",
+        {
+          body: {
+            valor: Number(saldo.toFixed(2)),
+            referencia: codigo,
+            email,
+          },
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        }
+      );
+
+      if (error) {
+        console.error("Erro ao chamar mercado-pago-criar-pix:", error);
+        throw error;
+      }
+      if (data?.error) {
+        throw new Error(data.error);
+      }
+
+      if (!data?.pix?.qrCodeBase64 || !data?.pix?.copiaCola) {
+        throw new Error("O Mercado Pago não retornou o QR Code do PIX.");
+      }
+
+      const pixGerado = {
+        orderId: data.orderId || "",
+        paymentId: data.paymentId || "",
+        status: data.status || "action_required",
+        statusDetalhe: data.statusDetalhe || "waiting_transfer",
+        referencia: data.referencia || codigo,
+        valor: data.valor || saldo.toFixed(2),
+        email,
+        geradoEm: new Date().toISOString(),
+        pix: {
+          copiaCola: data.pix?.copiaCola || "",
+          qrCodeBase64: data.pix?.qrCodeBase64 || "",
+          ticketUrl: data.pix?.ticketUrl || "",
+        },
+      };
+
+      setPixTemporarios((anterior) => ({
+        ...anterior,
+        [String(cobranca.id)]: pixGerado,
+      }));
+
+      const dadosPersistencia = {
+        mercado_pago_order_id: pixGerado.orderId || null,
+        mercado_pago_payment_id: pixGerado.paymentId || null,
+        mercado_pago_status: pixGerado.status || null,
+        mercado_pago_status_detalhe: pixGerado.statusDetalhe || null,
+        pix_copia_cola: pixGerado.pix.copiaCola || null,
+        pix_qr_code_base64: pixGerado.pix.qrCodeBase64 || null,
+        pix_ticket_url: pixGerado.pix.ticketUrl || null,
+        pix_email: pixGerado.email || null,
+        pix_gerado_em: pixGerado.geradoEm,
+        updated_at: new Date().toISOString(),
+      };
+
+      const { error: persistenciaError } = await supabase
+        .from("cobrancas_diarias")
+        .update(dadosPersistencia)
+        .eq("id", cobranca.id);
+
+      if (persistenciaError) {
+        console.warn(
+          "PIX criado, mas não foi possível persistir os dados do Mercado Pago em cobrancas_diarias:",
+          persistenciaError
+        );
+      } else {
+        setCobrancas((anteriores) =>
+          anteriores.map((item) =>
+            String(item.id) === String(cobranca.id)
+              ? { ...item, ...dadosPersistencia }
+              : item
+          )
+        );
+      }
+
+      if (mostrarMensagem) {
+        setMensagem(`PIX de ${formatarMoeda(saldo)} gerado com sucesso pelo Mercado Pago.`);
+      }
+
+      return {
+        ...cobranca,
+        ...dadosPersistencia,
+        __pix: pixGerado,
+      };
+    } finally {
+      setGerandoPixId(null);
+    }
+  }
+
+  async function gerarPixDoModal(forcarNovo = false) {
+    if (!cobrancaPix) return;
+
+    try {
+      const cobrancaAtualizada = await gerarPixMercadoPago(
+        cobrancaPix,
+        emailPix,
+        { forcarNovo, mostrarMensagem: true }
+      );
+
+      setCobrancaPix(cobrancaAtualizada);
+    } catch (error) {
+      console.error("Erro ao gerar PIX:", error);
+      setErro(error?.message || "Não foi possível gerar o PIX pelo Mercado Pago.");
+    }
+  }
+
   async function registrarPagamento(event) {
     event.preventDefault();
 
@@ -519,14 +796,8 @@ export default function PagamentosDiarias() {
     }
   }
 
-  function imprimirCobranca(cobranca) {
-    const veiculo = veiculoPorId(cobranca.veiculo_id);
-    const pago = totalPagoVeiculo(cobranca.veiculo_id);
-    const total = Number(cobranca.valor_total || 0);
-    const saldo = Math.max(0, total - pago);
-    const codigo = `COB-${String(cobranca.id).padStart(6, "0")}`;
-
-    const janela = window.open("", "_blank", "width=850,height=900");
+  async function imprimirCobranca(cobranca) {
+    const janela = window.open("", "_blank", "width=900,height=980");
     if (!janela) {
       setErro("O navegador bloqueou a janela de impressão.");
       return;
@@ -535,53 +806,182 @@ export default function PagamentosDiarias() {
     janela.document.write(`
       <!doctype html>
       <html lang="pt-BR">
-        <head>
-          <meta charset="utf-8" />
-          <title>${codigo}</title>
-          <style>
-            body { font-family: Arial, sans-serif; color: #211E1F; margin: 40px; }
-            .topo { border-bottom: 4px solid #FFC400; padding-bottom: 18px; margin-bottom: 24px; }
-            .titulo { font-size: 28px; font-weight: 800; margin: 0; }
-            .codigo { color: #666; margin-top: 6px; }
-            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }
-            .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; }
-            .rotulo { font-size: 11px; font-weight: 700; color: #777; text-transform: uppercase; }
-            .valor { font-size: 18px; font-weight: 800; margin-top: 5px; }
-            .total { background: #211E1F; color: white; border-radius: 12px; padding: 20px; margin-top: 24px; }
-            .total strong { color: #FFC400; font-size: 28px; }
-            .rodape { margin-top: 38px; color: #777; font-size: 12px; }
-          </style>
-        </head>
-        <body>
-          <div class="topo">
-            <h1 class="titulo">Cobrança de Diárias — Pátio Sul Brasil</h1>
-            <div class="codigo">${codigo}</div>
-          </div>
-
-          <div class="grid">
-            <div class="card"><div class="rotulo">Placa</div><div class="valor">${veiculo?.placa || "SEM PLACA"}</div></div>
-            <div class="card"><div class="rotulo">Pátio</div><div class="valor">${nomePatio(cobranca.patio_id)}</div></div>
-            <div class="card"><div class="rotulo">Veículo</div><div class="valor">${veiculo?.marca || ""} ${veiculo?.modelo || ""}</div></div>
-            <div class="card"><div class="rotulo">Proprietário</div><div class="valor">${veiculo?.proprietario || "-"}</div></div>
-            <div class="card"><div class="rotulo">Quantidade de diárias</div><div class="valor">${cobranca.quantidade_diarias}</div></div>
-            <div class="card"><div class="rotulo">Valor por diária</div><div class="valor">${formatarMoeda(cobranca.valor_diaria)}</div></div>
-            <div class="card"><div class="rotulo">Gerada em</div><div class="valor">${formatarDataHora(cobranca.gerada_em)}</div></div>
-            <div class="card"><div class="rotulo">Status</div><div class="valor">${statusFinanceiro(cobranca)}</div></div>
-          </div>
-
-          <div class="total">
-            <div>Total da cobrança</div>
-            <strong>${formatarMoeda(total)}</strong>
-            <div style="margin-top:12px">Pago: ${formatarMoeda(pago)} &nbsp; | &nbsp; Saldo: ${formatarMoeda(saldo)}</div>
-          </div>
-
-          <div class="rodape">Documento gerado pelo sistema Pátio Sul Brasil em ${new Date().toLocaleString("pt-BR")}.</div>
-          <script>window.onload = () => window.print();</script>
+        <head><meta charset="utf-8" /><title>Preparando cobrança...</title></head>
+        <body style="font-family:Arial,sans-serif;padding:40px;color:#211E1F">
+          <h2>Preparando cobrança...</h2>
+          <p>Gerando os dados e o QR Code PIX. Aguarde.</p>
         </body>
       </html>
     `);
-
     janela.document.close();
+
+    try {
+      const veiculo = veiculoPorId(cobranca.veiculo_id);
+      const pago = totalPagoVeiculo(cobranca.veiculo_id);
+      const total = Number(cobranca.valor_total || 0);
+      const saldo = Math.max(0, total - pago);
+      const codigo = `COB-${String(cobranca.id).padStart(6, "0")}`;
+      const status = statusFinanceiro(cobranca);
+
+      let pix = dadosPixCobranca(cobranca);
+
+      if (
+        saldo > 0.009 &&
+        status !== "CANCELADO" &&
+        (!pix?.pix?.qrCodeBase64 || !pix?.pix?.copiaCola)
+      ) {
+        const email = emailPadraoPix(cobranca);
+
+        if (!email || !email.includes("@")) {
+          janela.close();
+          abrirPix(cobranca);
+          throw new Error(
+            "Informe o e-mail no pagamento PIX antes de imprimir. Depois clique em Gerar PIX Mercado Pago."
+          );
+        }
+
+        const cobrancaAtualizada = await gerarPixMercadoPago(
+          cobranca,
+          email,
+          { forcarNovo: false, mostrarMensagem: false }
+        );
+
+        pix = cobrancaAtualizada.__pix || dadosPixCobranca(cobrancaAtualizada);
+      }
+
+      const qrCode = imagemQrPix(pix?.pix?.qrCodeBase64 || "");
+      const copiaCola = pix?.pix?.copiaCola || "";
+      const statusPix = pix
+        ? rotuloStatusPix(pix.status, pix.statusDetalhe)
+        : "SEM PIX GERADO";
+
+      janela.document.open();
+      janela.document.write(`
+        <!doctype html>
+        <html lang="pt-BR">
+          <head>
+            <meta charset="utf-8" />
+            <title>${escaparHtml(codigo)}</title>
+            <style>
+              * { box-sizing: border-box; }
+              body { font-family: Arial, sans-serif; color: #211E1F; margin: 34px; background: #fff; }
+              .topo { border-bottom: 4px solid #FFC400; padding-bottom: 18px; margin-bottom: 22px; }
+              .titulo { font-size: 27px; font-weight: 800; margin: 0; }
+              .codigo { color: #666; margin-top: 6px; font-size: 13px; }
+              .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; margin-top: 18px; }
+              .card { border: 1px solid #ddd; border-radius: 10px; padding: 13px; }
+              .rotulo { font-size: 10px; font-weight: 700; color: #777; text-transform: uppercase; }
+              .valor { font-size: 17px; font-weight: 800; margin-top: 5px; }
+              .resumo { display:grid; grid-template-columns:1.2fr 1fr 1fr; gap:10px; margin-top:20px; }
+              .total { background: #211E1F; color: white; border-radius: 12px; padding: 18px; }
+              .total strong { color: #FFC400; font-size: 27px; display:block; margin-top:5px; }
+              .pago { background:#ecfdf5; border-radius:12px; padding:18px; color:#047857; }
+              .saldo { background:#fffbeb; border-radius:12px; padding:18px; color:#b45309; }
+              .box-valor { display:block; font-size:22px; font-weight:800; margin-top:5px; }
+              .pix { margin-top:22px; border:1px solid #a7f3d0; border-radius:16px; overflow:hidden; page-break-inside:avoid; }
+              .pix-topo { background:#ecfdf5; padding:16px 18px; border-bottom:1px solid #d1fae5; }
+              .pix-titulo { font-size:16px; font-weight:800; color:#065f46; margin:0; }
+              .pix-sub { margin-top:4px; font-size:12px; color:#64748b; }
+              .pix-grid { display:grid; grid-template-columns:1.35fr .75fr; gap:20px; padding:18px; align-items:center; }
+              .pix-info { display:grid; gap:12px; }
+              .pix-linha { border-bottom:1px solid #eee; padding-bottom:10px; }
+              .pix-linha:last-child { border-bottom:0; }
+              .pix-codigo { margin-top:6px; font-size:10px; line-height:1.4; color:#475569; word-break:break-all; background:#f8fafc; padding:10px; border-radius:8px; }
+              .qr { text-align:center; border-left:1px solid #e5e7eb; padding-left:20px; }
+              .qr img { width:210px; height:210px; object-fit:contain; border:8px solid #fff; }
+              .qr p { margin:7px 0 0; font-size:11px; color:#64748b; }
+              .status-pix { display:inline-block; margin-top:7px; padding:6px 10px; border-radius:999px; background:#fff7cc; color:#8a6b00; font-size:10px; font-weight:800; }
+              .rodape { margin-top:28px; color:#777; font-size:11px; }
+              @media print {
+                body { margin: 18px; }
+                .qr img { width:190px; height:190px; }
+              }
+            </style>
+          </head>
+          <body>
+            <div class="topo">
+              <h1 class="titulo">Cobrança de Diárias — Pátio Sul Brasil</h1>
+              <div class="codigo">${escaparHtml(codigo)} • Gerada em ${escaparHtml(formatarDataHora(cobranca.gerada_em))}</div>
+            </div>
+
+            <div class="grid">
+              <div class="card"><div class="rotulo">Placa</div><div class="valor">${escaparHtml(veiculo?.placa || "SEM PLACA")}</div></div>
+              <div class="card"><div class="rotulo">Pátio</div><div class="valor">${escaparHtml(nomePatio(cobranca.patio_id))}</div></div>
+              <div class="card"><div class="rotulo">Veículo</div><div class="valor">${escaparHtml(`${veiculo?.marca || ""} ${veiculo?.modelo || ""}`.trim() || "-")}</div></div>
+              <div class="card"><div class="rotulo">Proprietário</div><div class="valor">${escaparHtml(veiculo?.proprietario || "-")}</div></div>
+              <div class="card"><div class="rotulo">Quantidade de diárias</div><div class="valor">${escaparHtml(cobranca.quantidade_diarias)}</div></div>
+              <div class="card"><div class="rotulo">Valor por diária</div><div class="valor">${escaparHtml(formatarMoeda(cobranca.valor_diaria))}</div></div>
+            </div>
+
+            <div class="resumo">
+              <div class="total">
+                <div class="rotulo" style="color:#fff9">Total da cobrança</div>
+                <strong>${escaparHtml(formatarMoeda(total))}</strong>
+              </div>
+              <div class="pago">
+                <div class="rotulo" style="color:#059669">Pago</div>
+                <span class="box-valor">${escaparHtml(formatarMoeda(pago))}</span>
+              </div>
+              <div class="saldo">
+                <div class="rotulo" style="color:#d97706">Saldo</div>
+                <span class="box-valor">${escaparHtml(formatarMoeda(saldo))}</span>
+              </div>
+            </div>
+
+            ${qrCode && saldo > 0.009 ? `
+              <section class="pix">
+                <div class="pix-topo">
+                  <h2 class="pix-titulo">Pagamento via PIX • Mercado Pago</h2>
+                  <div class="pix-sub">Escaneie o QR Code abaixo ou use o PIX Copia e Cola.</div>
+                </div>
+                <div class="pix-grid">
+                  <div class="pix-info">
+                    <div class="pix-linha">
+                      <div class="rotulo">Valor a pagar</div>
+                      <div class="valor" style="color:#047857">${escaparHtml(formatarMoeda(saldo))}</div>
+                    </div>
+                    <div class="pix-linha">
+                      <div class="rotulo">Cobrança</div>
+                      <div class="valor">${escaparHtml(codigo)}</div>
+                    </div>
+                    <div class="pix-linha">
+                      <div class="rotulo">PIX Copia e Cola</div>
+                      <div class="pix-codigo">${escaparHtml(copiaCola)}</div>
+                    </div>
+                    <div class="pix-linha">
+                      <div class="rotulo">Status Mercado Pago</div>
+                      <span class="status-pix">${escaparHtml(statusPix)}</span>
+                    </div>
+                  </div>
+                  <div class="qr">
+                    <img src="${escaparHtml(qrCode)}" alt="QR Code PIX" />
+                    <p>Escaneie para pagar</p>
+                  </div>
+                </div>
+              </section>
+            ` : ""}
+
+            <div class="rodape">Documento gerado pelo sistema Pátio Sul Brasil em ${escaparHtml(new Date().toLocaleString("pt-BR"))}.</div>
+            <script>
+              window.onload = function () {
+                var imagem = document.querySelector('.qr img');
+                if (imagem && !imagem.complete) {
+                  imagem.onload = function () { window.print(); };
+                  imagem.onerror = function () { window.print(); };
+                } else {
+                  window.print();
+                }
+              };
+            </script>
+          </body>
+        </html>
+      `);
+      janela.document.close();
+    } catch (error) {
+      console.error("Erro ao preparar impressão:", error);
+      if (!janela.closed) janela.close();
+      setErro(error?.message || "Não foi possível preparar a cobrança para impressão.");
+    }
   }
 
   if (loading) {
@@ -830,12 +1230,27 @@ export default function PagamentosDiarias() {
                     </div>
 
                     <div className="flex flex-wrap gap-2">
+                      {status !== "PAGO" && status !== "CANCELADO" && (
+                        <button
+                          type="button"
+                          onClick={() => abrirPix(cobranca)}
+                          className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs font-black text-emerald-700 hover:bg-emerald-100"
+                        >
+                          {dadosPixCobranca(cobranca)?.pix?.qrCodeBase64
+                            ? "◆ Ver PIX"
+                            : "◆ Gerar PIX"}
+                        </button>
+                      )}
+
                       <button
                         type="button"
                         onClick={() => imprimirCobranca(cobranca)}
-                        className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-50"
+                        disabled={gerandoPixId === cobranca.id}
+                        className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-50 disabled:cursor-wait disabled:opacity-50"
                       >
-                        🧾 Imprimir cobrança
+                        {gerandoPixId === cobranca.id
+                          ? "Gerando QR PIX..."
+                          : "🧾 Imprimir cobrança"}
                       </button>
 
                       {status !== "PAGO" && status !== "CANCELADO" && (
@@ -873,6 +1288,90 @@ export default function PagamentosDiarias() {
                     </div>
                   </div>
 
+                  {(() => {
+                    const dadosPix = dadosPixCobranca(cobranca);
+                    const possuiPix = Boolean(
+                      dadosPix?.pix?.qrCodeBase64 && dadosPix?.pix?.copiaCola
+                    );
+
+                    if (!possuiPix || status === "PAGO" || status === "CANCELADO") {
+                      return null;
+                    }
+
+                    return (
+                      <div className="border-t border-slate-100 px-5 py-5">
+                        <div className="overflow-hidden rounded-2xl border border-emerald-200 bg-white">
+                          <div className="flex flex-col gap-2 border-b border-emerald-100 bg-emerald-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                            <div>
+                              <p className="text-xs font-black uppercase tracking-wider text-emerald-700">
+                                Pagamento via PIX • Mercado Pago
+                              </p>
+                              <p className="mt-1 text-xs text-slate-500">
+                                Escaneie o QR Code ou use o PIX Copia e Cola.
+                              </p>
+                            </div>
+                            <span className="w-fit rounded-full bg-amber-100 px-3 py-1 text-[10px] font-black text-amber-700">
+                              {rotuloStatusPix(dadosPix.status, dadosPix.statusDetalhe)}
+                            </span>
+                          </div>
+
+                          <div className="grid gap-5 p-5 lg:grid-cols-[1fr_230px] lg:items-center">
+                            <div className="space-y-4">
+                              <div className="grid gap-3 sm:grid-cols-2">
+                                <div className="rounded-xl bg-emerald-50 p-4">
+                                  <p className="text-[10px] font-black uppercase text-emerald-600">Valor a pagar</p>
+                                  <p className="mt-1 text-xl font-black text-emerald-700">{formatarMoeda(saldo)}</p>
+                                </div>
+                                <div className="rounded-xl bg-slate-50 p-4">
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Cobrança</p>
+                                  <p className="mt-1 font-black text-[#211E1F]">COB-{String(cobranca.id).padStart(6, "0")}</p>
+                                </div>
+                              </div>
+
+                              <div>
+                                <div className="mb-2 flex items-center justify-between gap-3">
+                                  <p className="text-[10px] font-black uppercase text-slate-400">PIX Copia e Cola</p>
+                                  <button
+                                    type="button"
+                                    onClick={() => copiarCodigoPix(dadosPix.pix.copiaCola)}
+                                    className="rounded-lg bg-[#211E1F] px-3 py-2 text-[10px] font-black text-[#FFC400] hover:bg-[#2f2b2d]"
+                                  >
+                                    Copiar código
+                                  </button>
+                                </div>
+                                <div className="max-h-24 overflow-auto break-all rounded-xl border border-slate-200 bg-slate-50 p-3 text-[11px] leading-5 text-slate-600">
+                                  {dadosPix.pix.copiaCola}
+                                </div>
+                              </div>
+
+                              {dadosPix.pix.ticketUrl && (
+                                <a
+                                  href={dadosPix.pix.ticketUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex rounded-xl border border-emerald-200 bg-white px-4 py-2.5 text-xs font-black text-emerald-700 hover:bg-emerald-50"
+                                >
+                                  Abrir pagamento no Mercado Pago
+                                </a>
+                              )}
+                            </div>
+
+                            <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-200 bg-white p-4">
+                              <img
+                                src={imagemQrPix(dadosPix.pix.qrCodeBase64)}
+                                alt="QR Code PIX Mercado Pago"
+                                className="h-48 w-48 object-contain"
+                              />
+                              <p className="mt-2 text-center text-xs font-bold text-slate-500">
+                                Escaneie para pagar
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   {historico.length > 0 && (
                     <div className="border-t border-slate-100 px-5 py-4">
                       <p className="mb-3 text-xs font-black uppercase tracking-wide text-slate-400">
@@ -904,6 +1403,160 @@ export default function PagamentosDiarias() {
           </div>
         )}
       </div>
+
+      {cobrancaPix && (
+        <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/60 p-4">
+          <div className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
+            <div className="flex items-start justify-between gap-4 bg-[#211E1F] px-6 py-5">
+              <div>
+                <p className="text-xs font-black uppercase tracking-wider text-[#FFC400]">
+                  PIX Mercado Pago
+                </p>
+                <h2 className="mt-1 text-xl font-black text-white">
+                  {veiculoPorId(cobrancaPix.veiculo_id)?.placa || "SEM PLACA"} • COB-{String(cobrancaPix.id).padStart(6, "0")}
+                </h2>
+                <p className="mt-1 text-sm text-white/60">
+                  Saldo {formatarMoeda(Math.max(0, Number(cobrancaPix.valor_total || 0) - totalPagoVeiculo(cobrancaPix.veiculo_id)))}
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={fecharPix}
+                disabled={Boolean(gerandoPixId)}
+                className="rounded-lg border border-white/20 px-3 py-2 text-sm font-black text-white/80 hover:bg-white/10 disabled:opacity-50"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-6">
+              <div className="mb-5">
+                <label className="mb-2 block text-sm font-bold text-slate-700">
+                  E-mail do pagador *
+                </label>
+                <input
+                  type="email"
+                  value={emailPix}
+                  onChange={(event) => setEmailPix(event.target.value)}
+                  placeholder="cliente@email.com"
+                  className="w-full rounded-xl border border-slate-300 px-4 py-3 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/10"
+                />
+                <p className="mt-2 text-xs text-slate-400">
+                  O e-mail é enviado ao Mercado Pago como identificação do pagador.
+                </p>
+              </div>
+
+              {(() => {
+                const dadosPix = dadosPixCobranca(cobrancaPix);
+                if (!dadosPix?.pix?.qrCodeBase64) {
+                  return (
+                    <div className="rounded-2xl border border-dashed border-emerald-300 bg-emerald-50/50 p-8 text-center">
+                      <div className="text-4xl">◆</div>
+                      <h3 className="mt-3 font-black text-[#211E1F]">Gerar cobrança PIX</h3>
+                      <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-slate-500">
+                        O valor em aberto será enviado ao Mercado Pago e o QR Code será exibido aqui e também na impressão da cobrança.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => gerarPixDoModal(false)}
+                        disabled={gerandoPixId === cobrancaPix.id}
+                        className="mt-5 rounded-xl bg-emerald-600 px-5 py-3 text-sm font-black text-white hover:bg-emerald-700 disabled:cursor-wait disabled:opacity-50"
+                      >
+                        {gerandoPixId === cobrancaPix.id
+                          ? "Gerando PIX..."
+                          : "Gerar PIX Mercado Pago"}
+                      </button>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="overflow-hidden rounded-2xl border border-emerald-200">
+                    <div className="flex flex-col gap-2 border-b border-emerald-100 bg-emerald-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-xs font-black uppercase tracking-wider text-emerald-700">Pagamento via PIX</p>
+                        <p className="mt-1 text-xs text-slate-500">Mercado Pago • QR Code dinâmico</p>
+                      </div>
+                      <span className="w-fit rounded-full bg-amber-100 px-3 py-1 text-[10px] font-black text-amber-700">
+                        {rotuloStatusPix(dadosPix.status, dadosPix.statusDetalhe)}
+                      </span>
+                    </div>
+
+                    <div className="grid gap-6 p-5 md:grid-cols-[1fr_240px] md:items-center">
+                      <div className="space-y-4">
+                        <div className="rounded-xl bg-emerald-50 p-4">
+                          <p className="text-[10px] font-black uppercase text-emerald-600">Valor a pagar</p>
+                          <p className="mt-1 text-2xl font-black text-emerald-700">
+                            {formatarMoeda(Math.max(0, Number(cobrancaPix.valor_total || 0) - totalPagoVeiculo(cobrancaPix.veiculo_id)))}
+                          </p>
+                        </div>
+
+                        <div>
+                          <div className="mb-2 flex items-center justify-between gap-3">
+                            <p className="text-[10px] font-black uppercase text-slate-400">PIX Copia e Cola</p>
+                            <button
+                              type="button"
+                              onClick={() => copiarCodigoPix(dadosPix.pix.copiaCola)}
+                              className="rounded-lg bg-[#211E1F] px-3 py-2 text-[10px] font-black text-[#FFC400]"
+                            >
+                              Copiar
+                            </button>
+                          </div>
+                          <div className="max-h-28 overflow-auto break-all rounded-xl border border-slate-200 bg-slate-50 p-3 text-[11px] leading-5 text-slate-600">
+                            {dadosPix.pix.copiaCola}
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2">
+                          {dadosPix.pix.ticketUrl && (
+                            <a
+                              href={dadosPix.pix.ticketUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="rounded-xl border border-emerald-200 bg-white px-4 py-2.5 text-xs font-black text-emerald-700 hover:bg-emerald-50"
+                            >
+                              Abrir Mercado Pago
+                            </a>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => imprimirCobranca(cobrancaPix)}
+                            className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-50"
+                          >
+                            🧾 Imprimir com QR Code
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => gerarPixDoModal(true)}
+                            disabled={gerandoPixId === cobrancaPix.id}
+                            className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-black text-amber-700 hover:bg-amber-100 disabled:opacity-50"
+                          >
+                            {gerandoPixId === cobrancaPix.id ? "Gerando..." : "Gerar novo PIX"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-4">
+                        <img
+                          src={imagemQrPix(dadosPix.pix.qrCodeBase64)}
+                          alt="QR Code PIX Mercado Pago"
+                          className="h-52 w-52 object-contain"
+                        />
+                        <p className="mt-2 text-center text-xs font-bold text-slate-500">
+                          Escaneie para pagar
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
 
       {cobrancaPagamento && (
         <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4">
